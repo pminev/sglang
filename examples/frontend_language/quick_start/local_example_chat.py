@@ -84,15 +84,15 @@ if __name__ == "__main__":
     print("It took", time.time() - start, "seconds to setup backend!")
 
     # Run a single request
-    print("\n========== single ==========\n")
-    single()
-    print("It took", time.time() - start, "seconds to finish single!")
+    # print("\n========== single ==========\n")
+    # single()
+    # print("It took", time.time() - start, "seconds to finish single!")
 
-    # Stream output
-    print("\n========== stream ==========\n")
-    stream()
+    # # Stream output
+    # print("\n========== stream ==========\n")
+    # stream()
 
-    print("It took", time.time() - start, "seconds to finish stream!")
+    # print("It took", time.time() - start, "seconds to finish stream!")
 
     # Run a batch of requests
     # print("\n========== batch ==========\n")
