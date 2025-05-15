@@ -82,6 +82,9 @@ class DetokenizerManager:
             context, zmq.PUSH, port_args.tokenizer_ipc_name, False
         )
 
+        if server_args.tokenizer_path == 'nari-labs/Dia-1.6B':
+            server_args.skip_tokenizer_init = True
+
         if server_args.skip_tokenizer_init:
             self.tokenizer = None
         else:

@@ -135,12 +135,16 @@ class ModelConfig:
         else:
             self.context_len = derived_context_len
 
-        # Unify the config keys for hf_text_config
-        self.head_dim = getattr(
-            self.hf_text_config,
-            "head_dim",
-            self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
-        )
+        # TODO: handle Dia properly
+        if "Dia" in model_path:
+            self.head_dim = 128
+        else:
+            # Unify the config keys for hf_text_config
+            self.head_dim = getattr(
+                self.hf_text_config,
+                "head_dim",
+                self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
+            )
 
         # FIXME: temporary special judge for MLA architecture
         if (
@@ -187,10 +191,15 @@ class ModelConfig:
         else:
             self.attention_arch = AttentionArch.MHA
 
-        self.num_attention_heads = self.hf_text_config.num_attention_heads
-        self.num_key_value_heads = getattr(
-            self.hf_text_config, "num_key_value_heads", None
-        )
+        # TODO: handle Dia properly
+        if "Dia" in model_path:
+            self.num_attention_heads = 128
+            self.num_key_value_heads = 128
+        else:
+            self.num_attention_heads = self.hf_text_config.num_attention_heads
+            self.num_key_value_heads = getattr(
+                self.hf_text_config, "num_key_value_heads", None
+            )
 
         # for Dbrx and MPT models
         if self.hf_config.model_type in ["dbrx", "mpt"]:
@@ -200,9 +209,16 @@ class ModelConfig:
 
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
-        self.hidden_size = self.hf_text_config.hidden_size
-        self.num_hidden_layers = self.hf_text_config.num_hidden_layers
-        self.vocab_size = self.hf_text_config.vocab_size
+
+        # TODO: handle Dia properly
+        if "Dia" in model_path:
+            self.hidden_size = 8192
+            self.num_hidden_layers = 18
+            self.vocab_size = 256
+        else:
+            self.hidden_size = self.hf_text_config.hidden_size
+            self.num_hidden_layers = self.hf_text_config.num_hidden_layers
+            self.vocab_size = self.hf_text_config.vocab_size
 
         # Verify quantization
         self._verify_quantization()
@@ -578,7 +594,7 @@ def is_image_gen_model(model_architectures: List[str]):
 
 
 def is_audio_model(model_architectures: List[str]):
-    return False
+    return "DiaTTS" in model_architectures
 
 
 def is_encoder_decoder_model(model_architectures: List[str]):

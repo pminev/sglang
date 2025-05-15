@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, Optional, Type, Union
 
 import transformers
-from huggingface_hub import snapshot_download
+from huggingface_hub import snapshot_download, hf_hub_download
 from transformers import (
     AutoConfig,
     AutoProcessor,
@@ -39,6 +39,7 @@ from sglang.srt.configs import (
     ExaoneConfig,
     KimiVLConfig,
     MultiModalityConfig,
+    DiaConfig
 )
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
@@ -52,6 +53,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     MultiModalityConfig.model_type: MultiModalityConfig,
     KimiVLConfig.model_type: KimiVLConfig,
     InternVLChatConfig.model_type: InternVLChatConfig,
+    DiaConfig.model_type: DiaConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
@@ -65,7 +67,6 @@ def download_from_hf(model_path: str):
 
     return snapshot_download(model_path, allow_patterns=["*.json", "*.bin", "*.model"])
 
-
 def get_config(
     model: str,
     trust_remote_code: bool,
@@ -78,9 +79,14 @@ def get_config(
         kwargs["gguf_file"] = model
         model = Path(model).parent
 
-    config = AutoConfig.from_pretrained(
-        model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-    )
+    if model == 'nari-labs/Dia-1.6B':
+        config_path = hf_hub_download(repo_id=model, filename="config.json")
+        # checkpoint_path = hf_hub_download(repo_id=model, filename="dia-v0_1.pth")
+        config = DiaConfig.load(config_path)
+    else:
+        config = AutoConfig.from_pretrained(
+            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
 
     # FIXME: Pour contents of janus-pro's langauge_config to first-level
     if isinstance(model, str) and model.lower().startswith("deepseek-ai/janus-pro"):
@@ -91,7 +97,8 @@ def get_config(
 
     if config.model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[config.model_type]
-        config = config_class.from_pretrained(model, revision=revision)
+        if config.model_type != 'tts':
+            config = config_class.from_pretrained(model, revision=revision)
         # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
         setattr(config, "_name_or_path", model)
 
@@ -178,14 +185,17 @@ def get_tokenizer(
         tokenizer_name = client.get_local_dir()
 
     try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_name,
-            *args,
-            trust_remote_code=trust_remote_code,
-            tokenizer_revision=tokenizer_revision,
-            clean_up_tokenization_spaces=False,
-            **kwargs,
-        )
+        if tokenizer_name == 'nari-labs/Dia-1.6B':
+            tokenizer = None
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_name,
+                *args,
+                trust_remote_code=trust_remote_code,
+                tokenizer_revision=tokenizer_revision,
+                clean_up_tokenization_spaces=False,
+                **kwargs,
+            )
     except TypeError as e:
         # The LLaMA tokenizer causes a protobuf error in some environments.
         err_msg = (
