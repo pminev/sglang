@@ -57,19 +57,45 @@ def batch():
 
 
 if __name__ == "__main__":
-    runtime = sgl.Runtime(model_path="meta-llama/Llama-2-7b-chat-hf")
+    import time
+    from huggingface_hub import hf_hub_download
+
+    # Calculate the start time
+    start = time.time()
+    # runtime = sgl.Runtime(model_path="meta-llama/Llama-2-7b-chat-hf")
+
+    # model_path = hf_hub_download(
+    #     "bartowski/Llama-3.2-3B-Instruct-GGUF",
+    #     filename="Llama-3.2-3B-Instruct-Q4_K_L.gguf",
+    # )
+
+    # engine = sgl.Engine(model_path=model_path, random_seed=42, cuda_graph_max_bs=2)
+
+    # runtime = sgl.Runtime(
+    #     model_path=model_path,
+    #     log_level="debug")
+
+    runtime = sgl.Runtime(
+        model_path="meta-llama/Llama-3.2-1B",
+        log_level="debug")
     sgl.set_default_backend(runtime)
+
+    # Show the results : this can be altered however you like
+    print("It took", time.time() - start, "seconds to setup backend!")
 
     # Run a single request
     print("\n========== single ==========\n")
     single()
+    print("It took", time.time() - start, "seconds to finish single!")
 
     # Stream output
     print("\n========== stream ==========\n")
     stream()
 
+    print("It took", time.time() - start, "seconds to finish stream!")
+
     # Run a batch of requests
-    print("\n========== batch ==========\n")
-    batch()
+    # print("\n========== batch ==========\n")
+    # batch()
 
     runtime.shutdown()
