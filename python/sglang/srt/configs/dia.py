@@ -143,6 +143,7 @@ class DiaConfig(BaseModel, frozen=True):
     """
     model_type: ClassVar[str] = "tts"  # Annotated as ClassVar to avoid being treated as a field
     architectures: ClassVar[list[str]] = ["DiaTTS"]
+    num_attention_heads: ClassVar[int] = 0
     version: str = Field(default="1.0")
     model: ModelConfig
     # TODO: remove training. this is just for backwards-compatability

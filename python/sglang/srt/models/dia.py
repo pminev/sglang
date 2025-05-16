@@ -63,7 +63,7 @@ import typing as tp
 
 logger = logging.getLogger(__name__)
 
-
+DEFAULT_SAMPLE_RATE = 44100
 
 def build_delay_indices(B: int, T: int, C: int, delay_pattern: tp.List[int]) -> tp.Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -539,7 +539,7 @@ class RotaryEmbedding(nn.Module):
         embedding_dims: int,
         min_timescale: int = 1,
         max_timescale: int = 10000,
-        dtype: torch.dtype = torch.float32,
+        dtype: torch.dtype = torch.float16,
     ):
         super().__init__()
         if embedding_dims % 2 != 0:
@@ -776,16 +776,24 @@ class Encoder(nn.Module):
         model_config = config.model
         enc_config = config.model.encoder
 
-        self.embedding = nn.Embedding(
+        # self.embedding = nn.Embedding(
+        #     model_config.src_vocab_size,
+        #     enc_config.n_embd,
+        #     dtype=compute_dtype,
+        # )
+        self.embedding = VocabParallelEmbedding(
             model_config.src_vocab_size,
-            enc_config.n_embd,
-            dtype=compute_dtype,
+            enc_config.n_embd
         )
-        self.layers = nn.ModuleList([EncoderLayer(config, compute_dtype) for _ in range(enc_config.n_layer)])
+        # self.layers = nn.ModuleList([EncoderLayer(config, compute_dtype) for _ in range(enc_config.n_layer)])
+        self.layers = make_layers(
+            enc_config.n_layer,
+            lambda idx, prefix: EncoderLayer(config, compute_dtype),
+            prefix="encoder.layers"
+        )
         self.norm = RMSNorm(
             enc_config.n_embd,
-            eps=model_config.normalization_layer_epsilon,
-            dtype=torch.float32,
+            eps=model_config.normalization_layer_epsilon
         )
 
     def forward(
@@ -1006,7 +1014,7 @@ class Decoder(nn.Module):
         x = self.norm(x)
         logits_Bx1xCxV = self.logits_dense(x)
 
-        return logits_Bx1xCxV.to(torch.float32)
+        return logits_Bx1xCxV.to(torch.float16)
 
     def forward(self, tgt_ids_BxTxC: torch.Tensor, state: DecoderInferenceState) -> torch.Tensor:
         """
@@ -1060,7 +1068,7 @@ class DiaModel(nn.Module):
     def __init__(self, config: DiaConfig, compute_dtype: torch.dtype, quant_config: Optional[QuantizationConfig] = None):
         super().__init__()
         self.config = config
-        # self.encoder = Encoder(config, compute_dtype)
+        self.encoder = Encoder(config, compute_dtype)
         self.decoder = Decoder(config, quant_config, compute_dtype)
 
 def _sample_next_token(
@@ -1117,7 +1125,7 @@ class DiaTTS(nn.Module):
         quant_config: Optional[QuantizationConfig] = None
     ):
         # TODO: Add option for other dtypes - float16, bfloat16
-        return DiaModel(config, torch.float32, quant_config)
+        return DiaModel(config, torch.float16, quant_config)
 
     @torch.no_grad()
     def forward(
@@ -1205,154 +1213,40 @@ class DiaTTS(nn.Module):
         return len(params_dict)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
+            name = "model." + name
+            if name in params_dict.keys():
                 param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Skip loading kv_scale from ckpts towards new design.
-                if name.endswith(".kv_scale") and name not in params_dict:
-                    continue
-                if name in params_dict.keys():
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                else:
-                    logger.warning(f"Parameter {name} not found in params_dict")
-
-    def get_weights_by_name(
-        self, name: str, truncate_size: int = 100, tp_size: int = 1
-    ) -> Optional[torch.Tensor]:
-        """Get the weights of the parameter by its name. Similar to `get_parameter` in Hugging Face.
-
-        Only used for unit test with an unoptimized performance.
-        For optimized performance, please use torch.save and torch.load.
-        """
-        try:
-            if name == "lm_head.weight" and self.config.tie_word_embeddings:
-                logger.info(
-                    "word embedding is tied for this model, return embed_tokens.weight as lm_head.weight."
+                weight_loader = getattr(
+                    param, "weight_loader", default_weight_loader
                 )
-                return (
-                    self.model.embed_tokens.weight.cpu()
-                    .to(torch.float32)
-                    .numpy()
-                    .tolist()[:truncate_size]
-                )
-
-            mapped_name = name
-            mapped_shard_id = None
-            for param_name, weight_name, shard_id in self.stacked_params_mapping:
-                if weight_name in name:
-                    mapped_name = name.replace(weight_name, param_name)
-                    mapped_shard_id = shard_id
-                    break
-            params_dict = dict(self.named_parameters())
-            param = params_dict[mapped_name]
-            if mapped_shard_id is not None:
-                if mapped_shard_id in ["q", "k", "v"]:
-                    num_heads = self.config.num_attention_heads // tp_size
-                    num_kv_heads = self.config.num_key_value_heads // tp_size
-                    head_dim = (
-                        self.config.hidden_size // self.config.num_attention_heads
-                    )
-                    if mapped_shard_id == "q":
-                        offset = 0
-                        size = num_heads * head_dim
-                    elif mapped_shard_id == "k":
-                        offset = num_heads * head_dim
-                        size = num_kv_heads * head_dim
-                    elif mapped_shard_id == "v":
-                        offset = (num_heads + num_kv_heads) * head_dim
-                        size = num_kv_heads * head_dim
-                    weight = param.data.narrow(0, offset, size)
-                elif mapped_shard_id in [0, 1]:
-                    intermediate_size = self.config.intermediate_size
-                    slice_size = intermediate_size // tp_size
-                    if mapped_shard_id == 0:  # gate_proj
-                        offset = 0
-                        size = slice_size
-                    elif mapped_shard_id == 1:  # up_proj
-                        offset = slice_size
-                        size = slice_size
-
-                    weight = param.data.narrow(0, offset, size)
-                else:
-                    weight = param.data
+                weight_loader(param, loaded_weight)
             else:
-                weight = param.data
-            if tp_size > 1 and ("o_proj" in name or "down_proj" in name):
-                gathered_weights = [torch.zeros_like(weight) for _ in range(tp_size)]
-                torch.distributed.all_gather(gathered_weights, weight)
-                weight = torch.cat(gathered_weights, dim=1)
-            return weight.cpu().to(torch.float32).numpy().tolist()[:truncate_size]
+                logger.warning(f"Parameter {name} not found in params_dict")
 
-        except Exception:
-            logger.error(
-                f"Error getting weights by name {name} in LlamaForCausalLM: {get_exception_traceback()}"
-            )
-            return None
-
-    def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
-
-    def set_embed_and_head(self, embed, head):
-        del self.model.embed_tokens.weight
-        del self.lm_head.weight
-        self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-
-    def get_embed(self):
-        return self.model.embed_tokens.weight
-
-    def set_embed(self, embed):
-        # NOTE: If draft hidden size != target hidden size, the embed weight cannot be shared for EAGLE3
-        if (
-            hasattr(self.config, "target_hidden_size")
-            and self.config.target_hidden_size != self.config.hidden_size
-        ):
-            return
-        del self.model.embed_tokens.weight
-        self.model.embed_tokens.weight = embed
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        self.model.load_kv_cache_scales(quantization_param_path)
-
-    def set_eagle3_layers_to_capture(self):
-        if not self.pp_group.is_last_rank:
-            return
-
-        self.capture_aux_hidden_states = True
-        num_layers = self.config.num_hidden_layers
-        self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        print("forward")
+        # hidden_states = self.model(
+        #     input_ids,
+        #     positions,
+        #     forward_batch,
+        #     input_embeds,
+        #     pp_proxy_tensors=pp_proxy_tensors,
+        # )
+        # return dummmy
+        #Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]], PPProxyTensors]
+        return torch.zeros((1, 1, 1), device=input_ids.device, dtype=torch.float16)
 
 EntryClass = [DiaTTS]

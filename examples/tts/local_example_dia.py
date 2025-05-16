@@ -24,6 +24,11 @@ def single():
 
     print("\n-- answer_1 --\n", state["answer_1"])
 
+import os
+
+os.environ['CUDA_LAUNCH_BLOCKING']="1"
+os.environ['TORCH_USE_CUDA_DSA'] = "1"
+
 if __name__ == "__main__":
     import time
 
@@ -32,7 +37,9 @@ if __name__ == "__main__":
 
     runtime = sgl.Runtime(
         model_path="nari-labs/Dia-1.6B",
-        log_level="debug")
+        log_level="debug",
+        cuda_graph_max_bs=2,
+        mem_fraction_static=0.5)
     sgl.set_default_backend(runtime)
 
     # Show the results : this can be altered however you like
