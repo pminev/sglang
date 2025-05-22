@@ -8,14 +8,12 @@ import sglang as sgl
 @sgl.function
 def multi_turn_question(s, question_1, question_2):
     s += sgl.user(question_1)
-    s += sgl.assistant(sgl.gen("answer_1", max_tokens=256))
-    s += sgl.user(question_2)
-    s += sgl.assistant(sgl.gen("answer_2", max_tokens=256))
+    s += sgl.assistant(sgl.gen("answer_1", max_tokens=2048))
 
 
 def single():
     state = multi_turn_question.run(
-        question_1="What is the capital of the United States?",
+        question_1="[S1] Dia is an open weights text to dialogue model. [S2] You get full control over scripts and voices. [S1] Wow. Amazing. (laughs) [S2] Try it now on Git hub or Hugging Face.",
         question_2="List two local attractions.",
     )
 
@@ -39,7 +37,7 @@ if __name__ == "__main__":
         model_path="nari-labs/Dia-1.6B",
         log_level="debug",
         cuda_graph_max_bs=2,
-        mem_fraction_static=0.5)
+        mem_fraction_static=0.9)
     sgl.set_default_backend(runtime)
 
     # Show the results : this can be altered however you like
