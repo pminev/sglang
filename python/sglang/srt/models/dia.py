@@ -17,10 +17,13 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
+import time
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
+import torchaudio
 import torch.nn as nn
+import numpy as np
 
 from sglang.srt.configs import DiaConfig
 
@@ -29,21 +32,21 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
-from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
-from sglang.srt.layers.pooler import Pooler, PoolingType
+# from sglang.srt.layers.activation import SiluAndMul
+# from sglang.srt.layers.layernorm import RMSNorm
+# from sglang.srt.layers.linear import (
+#     MergedColumnParallelLinear,
+#     QKVParallelLinear,
+#     RowParallelLinear,
+# )
+# from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+# from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+# from sglang.srt.layers.radix_attention import RadixAttention
+# from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
+    # ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -539,7 +542,7 @@ class RotaryEmbedding(nn.Module):
         embedding_dims: int,
         min_timescale: int = 1,
         max_timescale: int = 10000,
-        dtype: torch.dtype = torch.float16,
+        dtype: torch.dtype = torch.float32,
     ):
         super().__init__()
         if embedding_dims % 2 != 0:
@@ -550,7 +553,7 @@ class RotaryEmbedding(nn.Module):
         self.dtype = dtype
 
         half_embedding_dim = embedding_dims // 2
-        fraction = (2.0 * torch.arange(0, half_embedding_dim)) / embedding_dims
+        fraction = (2.0 * torch.arange(0, half_embedding_dim)).to(torch.float32) / embedding_dims
         self.register_buffer(
             "timescale",
             self.min_timescale * (self.max_timescale / self.min_timescale) ** fraction,
@@ -719,9 +722,10 @@ class EncoderLayer(nn.Module):
         enc_config = config.model.encoder
         embed_dim = enc_config.n_embd
 
-        self.pre_sa_norm = RMSNorm(
+        self.pre_sa_norm = nn.RMSNorm(
             embed_dim,
             eps=model_config.normalization_layer_epsilon,
+            dtype=torch.float16,
         )
         self.self_attention = Attention(
             config,
@@ -734,9 +738,10 @@ class EncoderLayer(nn.Module):
             is_cross_attn=False,
             out_embed_dim=embed_dim,
         )
-        self.post_sa_norm = RMSNorm(
+        self.post_sa_norm = nn.RMSNorm(
             embed_dim,
             eps=model_config.normalization_layer_epsilon,
+            dtype=torch.float16,
         )
         self.mlp = MlpBlock(
             embed_dim=embed_dim,
@@ -791,9 +796,10 @@ class Encoder(nn.Module):
             lambda idx, prefix: EncoderLayer(config, compute_dtype),
             prefix="encoder.layers"
         )
-        self.norm = RMSNorm(
+        self.norm = nn.RMSNorm(
             enc_config.n_embd,
-            eps=model_config.normalization_layer_epsilon
+            eps=model_config.normalization_layer_epsilon,
+            dtype=torch.float16,
         )
 
     def forward(
@@ -823,17 +829,20 @@ class DecoderLayer(nn.Module):
         enc_embed_dim = enc_config.n_embd
 
         # Norms
-        self.pre_sa_norm = RMSNorm(
+        self.pre_sa_norm = nn.RMSNorm(
             dec_embed_dim,
             eps=model_config.normalization_layer_epsilon,
+            dtype=torch.float16,
         )
-        self.pre_ca_norm = RMSNorm(
+        self.pre_ca_norm = nn.RMSNorm(
             dec_embed_dim,
             eps=model_config.normalization_layer_epsilon,
+            dtype=torch.float16,
         )
-        self.pre_mlp_norm = RMSNorm(
+        self.pre_mlp_norm = nn.RMSNorm(
             dec_embed_dim,
             eps=model_config.normalization_layer_epsilon,
+            dtype=torch.float16,
         )
 
         # Self-Attention (GQA) with Causal Masking
@@ -876,6 +885,7 @@ class DecoderLayer(nn.Module):
         prefill: bool = False,
     ) -> torch.Tensor:
         residual = x
+
         x_norm = self.pre_sa_norm(x)
 
         sa_out = self.self_attention(
@@ -947,7 +957,7 @@ class Decoder(nn.Module):
             prefix="decoder.layers"
         )
 
-        self.norm = RMSNorm(
+        self.norm = nn.RMSNorm(
             dec_config.n_embd,
             eps=model_config.normalization_layer_epsilon,
         )
@@ -1061,15 +1071,231 @@ class Decoder(nn.Module):
 
         return logits_BxTxCxV.to(torch.float32)
 
-
 class DiaModel(nn.Module):
     """PyTorch Dia Model using DenseGeneral."""
+    default_instance = None
 
     def __init__(self, config: DiaConfig, compute_dtype: torch.dtype, quant_config: Optional[QuantizationConfig] = None):
         super().__init__()
         self.config = config
         self.encoder = Encoder(config, compute_dtype)
         self.decoder = Decoder(config, quant_config, compute_dtype)
+        self.device = torch.device("cuda")
+
+        self.compute_dtype = compute_dtype
+
+        state, out = self._prepare_generation("[S1] Dia is an open weights text to dialogue model. [S2] You get full control over scripts and voices. [S1] Wow. Amazing. (laughs) [S2] Try it now on Git hub or Hugging Face.", None, False)
+        self.dec_state = state
+        self.dec_output = out
+        self.dec_step = self.dec_output.prefill_step - 1
+
+
+    @classmethod
+    def init_default(cls, *args, **kwargs):
+        if cls.default_instance is None:
+            print("Initializing DiaModel default instance")
+            cls.default_instance = cls(*args, **kwargs)
+        return cls.default_instance
+
+    @classmethod
+    def get_default_instance(cls) -> "DiaModel":
+        # while cls.default_instance is None:
+        #     time.sleep(0.01)  # Wait 10ms before checking again
+
+        if cls.default_instance is None:
+            raise ValueError("DiaModel has not been initialized yet.")
+
+        return cls.default_instance
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        audio_eos_value = self.config.data.audio_eos_value
+        audio_pad_value = self.config.data.audio_pad_value
+        delay_pattern = self.config.data.delay_pattern
+        max_tokens = self.config.data.audio_length
+        max_delay_pattern = max(delay_pattern)
+        bos_countdown = max_delay_pattern
+
+        # self.dec_state.prepare_step(self.dec_step)
+
+        tokens_Bx1xC = self.dec_output.get_tokens_at(self.dec_step).unsqueeze(0).expand(2, -1, -1)
+        pred_C = self._decoder_step(
+                tokens_Bx1xC,
+                self.dec_state,
+                3.0, #cfg_scale,
+                1.3,#temperature,
+                0.95, #top_p,
+                35, #cfg_filter_top_k,
+            )
+
+        # This is part of after sampling generation
+        # I don't know where it should be moved
+        # TODO: Check where in llama.py is checking for eos
+        # if (not eos_detected and pred_C[0] == audio_eos_value) or dec_step == max_tokens - max_delay_pattern - 1:
+        #     eos_detected = True
+        #     eos_countdown = max_delay_pattern
+
+        # if eos_countdown > 0:
+        #     step_after_eos = max_delay_pattern - eos_countdown
+        #     for i, d in enumerate(delay_pattern):
+        #         if step_after_eos == d:
+        #             pred_C[i] = audio_eos_value
+        #         elif step_after_eos > d:
+        #             pred_C[i] = audio_pad_value
+        #     eos_countdown -= 1
+
+        bos_countdown = max(0, bos_countdown - 1)
+        self.dec_output.update_one(pred_C, self.dec_step + 1, bos_countdown > 0)
+
+        # TODO: Check where in llama.py is checking for eos
+        # This is commented on puprose
+        # if eos_countdown == 0:
+        #     break
+
+        self.dec_step += 1
+
+        return pred_C
+
+    def _decoder_step(
+        self,
+        tokens_Bx1xC: torch.Tensor,
+        dec_state: DecoderInferenceState,
+        cfg_scale: float,
+        temperature: float,
+        top_p: float,
+        cfg_filter_top_k: int,
+    ) -> torch.Tensor:
+        audio_eos_value = self.config.data.audio_eos_value
+        logits_Bx1xCxV = self.decoder.decode_step(tokens_Bx1xC, dec_state)
+
+        logits_last_BxCxV = logits_Bx1xCxV[:, -1, :, :]
+        uncond_logits_CxV = logits_last_BxCxV[0, :, :]
+        cond_logits_CxV = logits_last_BxCxV[1, :, :]
+
+        logits_CxV = cond_logits_CxV + cfg_scale * (cond_logits_CxV - uncond_logits_CxV)
+        logits_CxV[:, audio_eos_value + 1 :] = -torch.inf
+        logits_CxV[1:, audio_eos_value:] = -torch.inf
+
+        # TODO: Check where llama.py is making the sampling and move this there
+        pred_C = _sample_next_token(
+            logits_CxV.float(),
+            temperature=temperature,
+            top_p=top_p,
+            cfg_filter_top_k=cfg_filter_top_k,
+        )
+        return pred_C
+
+    def _prepare_generation(self, text: str, audio_prompt: str | torch.Tensor | None, verbose: bool):
+        enc_input_cond = self._prepare_text_input(text)
+        enc_input_uncond = torch.zeros_like(enc_input_cond)
+        enc_input = torch.cat([enc_input_uncond, enc_input_cond], dim=0)
+
+        if isinstance(audio_prompt, str):
+            audio_prompt = self.load_audio(audio_prompt)
+        prefill, prefill_step = self._prepare_audio_prompt(audio_prompt)
+
+        if verbose:
+            print("generate: data loaded")
+
+        enc_state = EncoderInferenceState.new(self.config, enc_input_cond)
+        encoder_out = self.encoder(enc_input, enc_state)
+
+        dec_cross_attn_cache = self.decoder.precompute_cross_attn_cache(encoder_out, enc_state.positions)
+        dec_state = DecoderInferenceState.new(
+            self.config, enc_state, encoder_out, dec_cross_attn_cache, self.compute_dtype
+        )
+        dec_output = DecoderOutput.new(self.config, self.device)
+        dec_output.prefill(prefill, prefill_step)
+
+        dec_step = prefill_step - 1
+        if dec_step > 0:
+            dec_state.prepare_step(0, dec_step)
+            tokens_BxTxC = dec_output.get_tokens_at(0, dec_step).unsqueeze(0).expand(2, -1, -1)
+            self.decoder.forward(tokens_BxTxC, dec_state)
+
+        return dec_state, dec_output
+
+    def load_audio(self, audio_path: str) -> torch.Tensor:
+        audio, sr = torchaudio.load(audio_path, channels_first=True)  # C, T
+        if sr != DEFAULT_SAMPLE_RATE:
+            audio = torchaudio.functional.resample(audio, sr, DEFAULT_SAMPLE_RATE)
+        audio = audio.to(self.device).unsqueeze(0)  # 1, C, T
+        audio_data = self.dac_model.preprocess(audio, DEFAULT_SAMPLE_RATE)
+        _, encoded_frame, _, _, _ = self.dac_model.encode(audio_data)  # 1, C, T
+        return encoded_frame.squeeze(0).transpose(0, 1)
+
+    # TODO: Probably to be removed, maybe should be as tokenizer
+    def _prepare_text_input(self, text: str) -> torch.Tensor:
+        """Encodes text prompt, pads, and creates attention mask and positions."""
+        text_pad_value = self.config.data.text_pad_value
+        max_len = self.config.data.text_length
+
+        byte_text = text.encode("utf-8")
+        replaced_bytes = byte_text.replace(b"[S1]", b"\x01").replace(b"[S2]", b"\x02")
+        text_tokens = list(replaced_bytes)
+
+        current_len = len(text_tokens)
+        padding_needed = max_len - current_len
+        if padding_needed <= 0:
+            text_tokens = text_tokens[:max_len]
+            padded_text_np = np.array(text_tokens, dtype=np.uint8)
+        else:
+            padded_text_np = np.pad(
+                text_tokens,
+                (0, padding_needed),
+                mode="constant",
+                constant_values=text_pad_value,
+            ).astype(np.uint8)
+
+        src_tokens = torch.from_numpy(padded_text_np).to(torch.long).to(self.device).unsqueeze(0)  # [1, S]
+        return src_tokens
+
+    def _prepare_audio_prompt(self, audio_prompt: torch.Tensor | None) -> tuple[torch.Tensor, int]:
+        num_channels = self.config.data.channels
+        audio_bos_value = self.config.data.audio_bos_value
+        audio_pad_value = self.config.data.audio_pad_value
+        delay_pattern = self.config.data.delay_pattern
+        max_delay_pattern = max(delay_pattern)
+
+        prefill = torch.full(
+            (1, num_channels),
+            fill_value=audio_bos_value,
+            dtype=torch.int,
+            device=self.device,
+        )
+
+        prefill_step = 1
+
+        if audio_prompt is not None:
+            prefill_step += audio_prompt.shape[0]
+            prefill = torch.cat([prefill, audio_prompt], dim=0)
+
+        delay_pad_tensor = torch.full(
+            (max_delay_pattern, num_channels), fill_value=-1, dtype=torch.int, device=self.device
+        )
+        prefill = torch.cat([prefill, delay_pad_tensor], dim=0)
+
+        delay_precomp = build_delay_indices(
+            B=1,
+            T=prefill.shape[0],
+            C=num_channels,
+            delay_pattern=delay_pattern,
+        )
+
+        prefill = apply_audio_delay(
+            audio_BxTxC=prefill.unsqueeze(0),
+            pad_value=audio_pad_value,
+            bos_value=audio_bos_value,
+            precomp=delay_precomp,
+        ).squeeze(0)
+
+        return prefill, prefill_step
 
 def _sample_next_token(
     logits_BCxV: torch.Tensor,
@@ -1125,92 +1351,7 @@ class DiaTTS(nn.Module):
         quant_config: Optional[QuantizationConfig] = None
     ):
         # TODO: Add option for other dtypes - float16, bfloat16
-        return DiaModel(config, torch.float16, quant_config)
-
-    @torch.no_grad()
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        input_embeds: torch.Tensor = None,
-        get_embedding: bool = False,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> LogitsProcessorOutput:
-        hidden_states = self.model(
-            input_ids,
-            positions,
-            forward_batch,
-            input_embeds,
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
-
-        aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
-
-        if self.pp_group.is_last_rank:
-            if not get_embedding:
-                return self.logits_processor(
-                    input_ids,
-                    hidden_states,
-                    self.lm_head,
-                    forward_batch,
-                    aux_hidden_states,
-                )
-            else:
-                return self.pooler(hidden_states, forward_batch)
-        else:
-            return hidden_states
-
-    @property
-    def start_layer(self):
-        return self.model.start_layer
-
-    @property
-    def end_layer(self):
-        return self.model.end_layer
-
-    def get_input_embeddings(self) -> nn.Embedding:
-        return self.model.embed_tokens
-
-    def get_hidden_dim(self, module_name):
-        # return input_dim, output_dim
-        if module_name in ["q_proj", "o_proj", "qkv_proj"]:
-            return self.config.hidden_size, self.config.hidden_size
-        elif module_name in ["kv_proj"]:
-            return self.config.hidden_size, self.config.hidden_size // (
-                self.config.num_attention_heads // self.config.num_key_value_heads
-            )
-        elif module_name == "gate_up_proj":
-            return self.config.hidden_size, self.config.intermediate_size
-        elif module_name == "down_proj":
-            return self.config.intermediate_size, self.config.hidden_size
-        else:
-            raise NotImplementedError()
-
-    def get_module_name(self, name):
-        params_mapping = {
-            "q_proj": "qkv_proj",
-            "k_proj": "qkv_proj",
-            "v_proj": "qkv_proj",
-            "gate_proj": "gate_up_proj",
-            "up_proj": "gate_up_proj",
-        }
-        return params_mapping.get(name, name)
-
-    def get_module_name_from_weight_name(self, name):
-        for param_name, weight_name, shard_id, num_shard in self.stacked_params_mapping:
-            if weight_name in name:
-                return (
-                    name.replace(weight_name, param_name)[: -len(".weight")],
-                    num_shard,
-                )
-        return name[: -len(".weight")], 1
-
-    def get_num_params(self):
-        params_dict = dict(self.named_parameters())
-        return len(params_dict)
+        return DiaModel.init_default(config, torch.float16, quant_config)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
@@ -1227,6 +1368,9 @@ class DiaTTS(nn.Module):
             else:
                 logger.warning(f"Parameter {name} not found in params_dict")
 
+    def prepare_generation(self):
+        self.model.dec_state.prepare_step(self.model.dec_step)
+
     @torch.no_grad()
     def forward(
         self,
@@ -1238,15 +1382,12 @@ class DiaTTS(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         print("forward")
-        # hidden_states = self.model(
-        #     input_ids,
-        #     positions,
-        #     forward_batch,
-        #     input_embeds,
-        #     pp_proxy_tensors=pp_proxy_tensors,
-        # )
-        # return dummmy
-        #Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]], PPProxyTensors]
-        return torch.zeros((1, 1, 1), device=input_ids.device, dtype=torch.float16)
+        return self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
 
 EntryClass = [DiaTTS]

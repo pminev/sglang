@@ -476,16 +476,12 @@ class Scheduler(
                 )
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
-                if self.model_config.hf_config.model_type == "tts":
-                    # TODO: Add proper tokenizer for Dia
-                    self.tokenizer = None
-                else:
-                    self.tokenizer = get_tokenizer(
-                        server_args.tokenizer_path,
-                        tokenizer_mode=server_args.tokenizer_mode,
-                        trust_remote_code=server_args.trust_remote_code,
-                        revision=server_args.revision,
-                    )
+                self.tokenizer = get_tokenizer(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                )
 
     def init_memory_pool_and_cache(self):
         server_args = self.server_args

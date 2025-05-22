@@ -20,7 +20,6 @@ from threading import Event
 from typing import Dict, List, Optional, Tuple
 
 import torch
-
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -167,6 +166,11 @@ class BaseGrammarBackend:
 def create_grammar_backend(
     server_args: ServerArgs, tokenizer, vocab_size: int
 ) -> Optional[BaseGrammarBackend]:
+
+    from sglang.srt.dia_tokenizer import DiaTokenizer
+    if isinstance(tokenizer, DiaTokenizer):
+        return None
+
     if server_args.grammar_backend == "outlines":
         from sglang.srt.constrained.outlines_backend import OutlinesGrammarBackend
 

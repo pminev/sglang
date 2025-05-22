@@ -164,7 +164,7 @@ def get_tokenizer(
     trust_remote_code: bool = False,
     tokenizer_revision: Optional[str] = None,
     **kwargs,
-) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
+) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast, any]:
     """Gets a tokenizer for the given model name via Huggingface."""
     if tokenizer_mode == "slow":
         if kwargs.get("use_fast", False):
@@ -186,7 +186,9 @@ def get_tokenizer(
 
     try:
         if tokenizer_name == 'nari-labs/Dia-1.6B':
-            tokenizer = None
+            from sglang.srt.dia_tokenizer import DiaTokenizer
+            config = get_config(tokenizer_name, trust_remote_code)
+            tokenizer= DiaTokenizer(config)
         else:
             tokenizer = AutoTokenizer.from_pretrained(
                 tokenizer_name,
@@ -227,7 +229,8 @@ def get_tokenizer(
             "slowdown. Consider using a fast tokenizer instead."
         )
 
-    attach_additional_stop_token_ids(tokenizer)
+    if not isinstance(tokenizer, DiaTokenizer):
+        attach_additional_stop_token_ids(tokenizer)
     return tokenizer
 
 

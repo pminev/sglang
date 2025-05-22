@@ -497,17 +497,25 @@ class CudaGraphRunner:
             )
             return logits_output_or_pp_proxy_tensors
 
+        from sglang.srt.models.dia import DiaTTS
+
         for _ in range(2):
             torch.cuda.synchronize()
             self.model_runner.tp_group.barrier()
 
-            run_once()
+            if isinstance(self.model_runner.model, DiaTTS):
+                self.model_runner.model.prepare_generation()
 
-        global global_graph_memory_pool
-        with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=stream):
             out = run_once()
 
-        global_graph_memory_pool = graph.pool()
+        if isinstance(self.model_runner.model, DiaTTS):
+            self.model_runner.model.prepare_generation()
+
+        global global_graph_memory_pool
+        # with torch.cuda.graph(graph, pool=global_graph_memory_pool, stream=stream):
+        #     out = run_once()
+
+        # global_graph_memory_pool = graph.pool()
         return graph, out
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
